@@ -1,0 +1,9 @@
+{
+    "retrieval": {"method": "bm25", "k1": 1.5, "b": 0.75},
+    "tokenization": {
+        "lowercase": true,
+        "include_math_symbols": true,
+        "min_token_length": 1,
+    "tokenizer_version": "TODO: must be bumped manually"
+    }
+}

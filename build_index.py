@@ -12,7 +12,7 @@ from pathlib import Path
 
 import psutil
 from rank_bm25 import BM25Okapi
-
+from scripts.tokenizer import tokenize
 
 def read_json(path):
     with open(path, "r", encoding="utf-8") as f:
@@ -39,6 +39,7 @@ def read_jsonl(path):
     return rows
 
 
+# TODO: move to helper tokenizer
 MATH_SYMBOLS = (
     "+\\-−*/=<>≤≥≠≈∂∆△∇∑∏√∞∈∉⊂⊃⊆⊇∩∪∅"
     "∧∨∀∃→↔ℂℝℤℕ∫∮×·⋅±"
@@ -52,7 +53,6 @@ MATH_PATTERN = re.compile(
 DIGIT_REF = re.compile(r"\d+(?:\.\d+)+")
 
 SECTION_WEIGHT = 2
-
 
 def get_token_settings(config):
     raw = config.get("tokenization", {})
@@ -72,23 +72,6 @@ def get_token_settings(config):
     ):
         raise ValueError("tokenization.min_token_length must be an integer >= 1.")
     return settings
-
-
-def tokenize(text, settings):
-    """Tokenize preserving digit refs (2.1), identifiers (u_x, x^2), and
-    math symbols when enabled.
-    """
-    digit_refs = DIGIT_REF.findall(text)
-    text = DIGIT_REF.sub(" ", text)
-
-    pattern = MATH_PATTERN if settings["include_math_symbols"] else WORD_PATTERN
-    tokens = digit_refs + pattern.findall(text)
-
-    if settings["lowercase"]:
-        tokens = [token.casefold() for token in tokens]
-
-    minimum = settings["min_token_length"]
-    return [token for token in tokens if len(token) >= minimum]
 
 
 def normalize_documents(rows):
@@ -184,7 +167,7 @@ def main():
     if not config_path.is_file():
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
-    # Config validation before touching the corpus — a bad k1/b/method
+    # Config validation before touching the corpus - a bad k1/b/method
     # fails immediately rather than after a full tokenize pass.
     config = read_json(config_path)
     token_settings = get_token_settings(config)
