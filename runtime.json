@@ -1,0 +1,15 @@
+{
+    "retrieval": {"top_k": 5},
+    "generation": {"temperature": 0.0, "max_tokens": 1024},
+    "timeout_seconds": 180,
+    "budget": {
+        "max_llm_calls_per_question": 4,
+        "max_input_tokens_total": 16384,
+        "max_output_tokens_total": 4096,
+        "max_input_plus_output_per_call": 8192
+    },
+    "model": {
+        "name": "Qwen/Qwen3.5-4B",
+        "revision": "851bf6e"
+    }
+}
