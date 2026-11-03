@@ -1,93 +1,9 @@
-"""
-Stage 3: pairs.jsonl -> dev questions + gold.
-
-Input:  data/pairs.jsonl              (source of truth)
-Output: data/dev_questions.jsonl
-        data/dev_gold.jsonl
-
-Input schema (per record):
-
-    {
-        "id": "tfkp_dev_01",
-        "title": "Когда условий Коши—Римана достаточно?",
-        "category": "conditions",
-        "difficulty": "средняя",
-        "question": "Пусть $f=u+iv$ ...",
-        "options": [{"id": "A", "text": "..."}, ...],
-        "answer_ids": ["B", "C"],
-        "abstain": false,
-        "reference_answer": "Теорема 2.1 требует ...",
-        "reference_pages": [11],
-        "source_locator": "Теорема 2.1; определение 2.2.",
-        "common_mistake": "Подменить вещественную ..."
-    }
-
-Output schemas:
-
-  dev_questions.jsonl:
-    {"id", "title", "question", "options"}
-    -- input presented to the model.
-
-  dev_gold.jsonl:
-    {
-        "id", "answer_ids", "abstain", "rationale",          # rationale = reference_answer
-        "reference_pages", "source_locator",                  # human, source of truth
-        "evidence_sets": [[block_id, ...]],                   # derived, heuristic
-        "category", "difficulty", "common_mistake"
-    }
-
-Both page-level and block-level references are present. Consumers that
-depend on block ids should read `evidence_sets`; consumers that prefer
-stable, human-authored references should read `reference_pages` and
-`source_locator`.
-
-evidence_sets: HOW THEY ARE BUILT AND WHAT THEY ARE WORTH
-=========================================================
-
-`evidence_sets` is DERIVED, not human-authored. It is computed from the
-human-provided `reference_pages` and `source_locator`, joined against the
-current `corpus.jsonl`. It is regenerated on every run, so it always agrees
-with the current chunker — but a change to stage 2 chunking WILL change the
-block ids in `evidence_sets`, whereas `reference_pages` and `source_locator`
-are invariant.
-
-Selection is locator-grounded:
-
-  1. The `source_locator` is split into items ("Теорема 2.1",
-     "определение 2.2", ...).
-  2. Query tokens = title + question + correct option texts +
-     reference_answer, plus locator tokens with a small boost.
-  3. For each reference page, prefer blocks whose stage-2 `section` field
-     contains at least one locator item verbatim (i.e. the block was
-     emitted under exactly the theorem the human cited). Ties broken by
-     TF-IDF over the boosted query, then by a tiny size bonus.
-  4. If no block on a page has a section match, the top TF-IDF block is
-     used and the page is flagged as a "fallback" hit.
-
-This is a heuristic, not a truth claim. It removes the worst form of
-circularity (using the retriever's own signal to pick gold) but does not
-prove correctness — a page may contain many blocks and the locator may be
-paraphrased. Consumers of this gold should therefore:
-
-  * treat `reference_pages` as authoritative and `evidence_sets` as a hint;
-  * score RECALL against pages first;
-  * score PRECISION against `source_locator` by checking whether a retrieved
-    block's text (or its section) matches the locator — substring match on
-    theorem numbers, or an LLM judge for paraphrased locators;
-  * NEVER treat block_id equality against `evidence_sets` as ground truth
-    across runs — it is only valid within the corpus.jsonl it was built from.
-"""
+import argparse
 import json
 import math
 import re
 from collections import Counter
 from pathlib import Path
-
-ROOT = Path(__file__).resolve().parent.parent
-PAIRS_FILE = ROOT / "data" / "pairs.jsonl"
-CORPUS_FILE = ROOT / "data" / "corpus.jsonl"
-QUESTIONS_FILE = ROOT / "data" / "dev_questions.jsonl"
-GOLD_FILE = ROOT / "data" / "dev_gold.jsonl"
 
 VALID_ANSWER_IDS = frozenset({"A", "B", "C", "D"})
 
@@ -103,14 +19,10 @@ REQUIRED_FIELDS = frozenset({
     "category",
 })
 
-# Weight applied to each occurrence of a locator token in the selection
-# query. Values of 3-10 are a good range; too high drowns out the question.
-LOCATOR_QUERY_BOOST = 5
+DEFAULT_LOCATOR_QUERY_BOOST = 5
 
 
-# ---------------------------------------------------------------------------
 # IO
-# ---------------------------------------------------------------------------
 
 def read_jsonl(path: Path) -> list[dict]:
     with path.open(encoding="utf-8") as f:
@@ -118,6 +30,7 @@ def read_jsonl(path: Path) -> list[dict]:
 
 
 def write_jsonl(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -127,9 +40,7 @@ def tokens(text: str) -> list[str]:
     return re.findall(r"[a-zа-яё0-9]+", text.lower())
 
 
-# ---------------------------------------------------------------------------
 # Validation
-# ---------------------------------------------------------------------------
 
 def validate_record(record: dict) -> None:
     rid = record.get("id", "<no id>")
@@ -189,10 +100,7 @@ def validate_corpus_has_pages(records: list[dict], corpus_pages: set[int]) -> No
             f"content from those pages."
         )
 
-
-# ---------------------------------------------------------------------------
 # evidence_sets construction
-# ---------------------------------------------------------------------------
 
 def locator_items(locator: str) -> list[str]:
     """Split a source_locator into normalized items.
@@ -216,7 +124,10 @@ def build_idf(corpus: list[dict]) -> dict[str, float]:
     return {t: math.log(1 + total / (1 + n)) for t, n in df.items()}
 
 
-def build_query_counter(record: dict) -> Counter:
+def build_query_counter(
+    record: dict,
+    locator_boost: int = DEFAULT_LOCATOR_QUERY_BOOST,
+) -> Counter:
     """Query tokens for block selection: title + question + correct options +
     reference_answer, with locator tokens boosted.
     """
@@ -231,7 +142,7 @@ def build_query_counter(record: dict) -> Counter:
     ]
     counts: Counter = Counter(tokens(" ".join(parts)))
     for tok in tokens(record["source_locator"]):
-        counts[tok] += LOCATOR_QUERY_BOOST
+        counts[tok] += locator_boost
     return counts
 
 
@@ -249,13 +160,7 @@ def choose_block(
     idf: dict[str, float],
     locator_items_: list[str],
 ) -> tuple[dict, bool]:
-    """Select the best block on a page.
-
-    Returns (block, grounded). `grounded` is True iff the chosen block's
-    section contains at least one locator item — i.e. the block was emitted
-    under exactly the theorem / definition the human cited, rather than
-    being merely topically similar.
-    """
+    """Select the best block on a page"""
     best_block: dict | None = None
     best_key: tuple[int, float] | None = None
 
@@ -282,17 +187,13 @@ def build_evidence_sets(
     record: dict,
     by_page: dict[int, list[dict]],
     idf: dict[str, float],
+    locator_boost: int = DEFAULT_LOCATOR_QUERY_BOOST,
 ) -> tuple[list[list[str]], int, int]:
     """Build evidence_sets for a non-abstain record.
 
     Returns (evidence_sets, grounded_pages, total_pages).
-
-    Shape of evidence_sets matches the previous schema: an outer list to
-    allow future multi-hop records (each element is one hop), each element
-    being the block ids supporting that hop. Currently every record is
-    single-hop, so the outer list has length 1.
     """
-    query_counts = build_query_counter(record)
+    query_counts = build_query_counter(record, locator_boost=locator_boost)
     loc_items = locator_items(record["source_locator"])
 
     selected: list[str] = []
@@ -309,36 +210,74 @@ def build_evidence_sets(
             grounded_pages += 1
 
     # Deduplicate while preserving order (a page pair can pick the same block
-    # if the locator spans a boundary — rare but harmless to guard).
+    # if the locator spans a boundary - rare but harmless to guard).
     deduped = list(dict.fromkeys(selected))
     return [deduped], grounded_pages, len(record["reference_pages"])
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+def parse_args() -> argparse.Namespace:
+    ROOT = Path(__file__).resolve().parent.parent
+
+    parser = argparse.ArgumentParser(
+        description="Build dev questions and gold evidence sets from QA pairs and corpus.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--pairs",
+        type=Path,
+        default=ROOT / "data" / "pairs.jsonl",
+        help="Path to the input QA pairs JSONL file.",
+    )
+    parser.add_argument(
+        "--corpus",
+        type=Path,
+        default=ROOT / "data" / "corpus.jsonl",
+        help="Path to the input corpus JSONL file.",
+    )
+    parser.add_argument(
+        "--questions",
+        type=Path,
+        default=ROOT / "data" / "dev_questions.jsonl",
+        help="Path to the output questions JSONL file.",
+    )
+    parser.add_argument(
+        "--gold",
+        type=Path,
+        default=ROOT / "data" / "dev_gold.jsonl",
+        help="Path to the output gold JSONL file.",
+    )
+    parser.add_argument(
+        "--locator-boost",
+        type=int,
+        default=DEFAULT_LOCATOR_QUERY_BOOST,
+        help="Weight boost applied to tokens from source_locator during TF-IDF matching.",
+    )
+    return parser.parse_args()
+
 
 def main() -> None:
-    if not PAIRS_FILE.exists():
-        raise FileNotFoundError(f"Missing {PAIRS_FILE}")
-    if not CORPUS_FILE.exists():
+    args = parse_args()
+
+    if not args.pairs.exists():
+        raise FileNotFoundError(f"Missing {args.pairs}")
+    if not args.corpus.exists():
         raise FileNotFoundError(
-            f"Missing {CORPUS_FILE} — run extract_markdown.py and "
-            f"extract_text.py first"
+            f"Missing {args.corpus} - run extract_markdown.py and "
+            f"build_corpus.py first"
         )
 
-    records = read_jsonl(PAIRS_FILE)
+    records = read_jsonl(args.pairs)
     if not records:
-        raise ValueError(f"{PAIRS_FILE} is empty")
+        raise ValueError(f"{args.pairs} is empty")
 
     seen: set[str] = set()
     for record in records:
         validate_record(record)
         if record["id"] in seen:
-            raise ValueError(f"Duplicate id in {PAIRS_FILE}: {record['id']}")
+            raise ValueError(f"Duplicate id in {args.pairs}: {record['id']}")
         seen.add(record["id"])
 
-    corpus = read_jsonl(CORPUS_FILE)
+    corpus = read_jsonl(args.corpus)
     by_page: dict[int, list[dict]] = {}
     for block in corpus:
         by_page.setdefault(int(block["page"]), []).append(block)
@@ -367,7 +306,10 @@ def main() -> None:
             evidence_sets: list[list[str]] = []
         else:
             evidence_sets, grounded, n = build_evidence_sets(
-                record, by_page, idf
+                record,
+                by_page,
+                idf,
+                locator_boost=args.locator_boost,
             )
             total_pages += n
             if grounded < n:
@@ -376,7 +318,9 @@ def main() -> None:
                     page_blocks = by_page.get(page, [])
                     _, g = choose_block(
                         page_blocks,
-                        build_query_counter(record),
+                        build_query_counter(
+                            record, locator_boost=args.locator_boost
+                        ),
                         idf,
                         locator_items(record["source_locator"]),
                     )
@@ -398,11 +342,11 @@ def main() -> None:
             }
         )
 
-    write_jsonl(QUESTIONS_FILE, dev_questions)
-    write_jsonl(GOLD_FILE, dev_gold)
+    write_jsonl(args.questions, dev_questions)
+    write_jsonl(args.gold, dev_gold)
 
-    print(f"Created {QUESTIONS_FILE} ({len(dev_questions)} questions)")
-    print(f"Created {GOLD_FILE} ({len(dev_gold)} gold records)")
+    print(f"Created {args.questions} ({len(dev_questions)} questions)")
+    print(f"Created {args.gold} ({len(dev_gold)} gold records)")
     print(
         f"Citation grounding: "
         f"{total_pages - len(fallback_pages)}/{total_pages} pages matched "

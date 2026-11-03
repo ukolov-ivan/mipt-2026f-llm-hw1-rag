@@ -1,18 +1,16 @@
+import argparse
 import json
 import re
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-INPUT_PATH = ROOT / "data" / "paragraphs.jsonl"
-OUTPUT_PATH = ROOT / "data" / "corpus.jsonl"
 
-MIN_CHARS = 80
-DISCARD_CHARS = 30
-MAX_CHARS = 1200
+DEFAULT_MIN_CHARS = 80
+DEFAULT_DISCARD_CHARS = 30
+DEFAULT_MAX_CHARS = 1200
 
 
-def split_long(text: str) -> list[str]:
-    if len(text) <= MAX_CHARS:
+def split_long(text: str, max_chars: int = DEFAULT_MAX_CHARS) -> list[str]:
+    if len(text) <= max_chars:
         return [text]
 
     sentences = re.split(r"(?<=[.!?;])\s+", text)
@@ -22,7 +20,7 @@ def split_long(text: str) -> list[str]:
 
     for sentence in sentences:
         candidate = (current + " " + sentence).strip() if current else sentence
-        if len(candidate) > MAX_CHARS and current:
+        if len(candidate) > max_chars and current:
             chunks.append(current.strip())
             current = sentence
         else:
@@ -34,14 +32,19 @@ def split_long(text: str) -> list[str]:
     return chunks if chunks else [text]
 
 
-def is_noise(text: str) -> bool:
-    if len(text) < DISCARD_CHARS:
+def is_noise(text: str, discard_chars: int = DEFAULT_DISCARD_CHARS) -> bool:
+    if len(text) < discard_chars:
         return True
     printable = re.sub(r"[\s.\-–—]", "", text)
-    return len(printable) < DISCARD_CHARS // 2
+    return len(printable) < discard_chars // 2
 
 
-def merge_and_chunk(records: list[dict]) -> list[dict]:
+def merge_and_chunk(
+    records: list[dict],
+    min_chars: int = DEFAULT_MIN_CHARS,
+    discard_chars: int = DEFAULT_DISCARD_CHARS,
+    max_chars: int = DEFAULT_MAX_CHARS,
+) -> list[dict]:
     """
     Merge short records, split long ones, tag each block with the current
     heading, drop noise. Returns a list of {page, section, text}.
@@ -55,9 +58,9 @@ def merge_and_chunk(records: list[dict]) -> list[dict]:
         nonlocal buf_text, buf_page
         if buf_text is None:
             return
-        for chunk in split_long(buf_text):
+        for chunk in split_long(buf_text, max_chars=max_chars):
             chunk = chunk.strip()
-            if is_noise(chunk):
+            if is_noise(chunk, discard_chars=discard_chars):
                 continue
             blocks.append(
                 {"page": buf_page, "section": current_section, "text": chunk}
@@ -81,17 +84,23 @@ def merge_and_chunk(records: list[dict]) -> list[dict]:
         else:
             buf_text += "\n\n" + text
 
-        if len(buf_text) >= MIN_CHARS:
+        if len(buf_text) >= min_chars:
             flush()
 
     flush()
     return blocks
 
 
-def build_corpus(input_path: Path, output_path: Path) -> None:
+def build_corpus(
+    input_path: Path,
+    output_path: Path,
+    min_chars: int = DEFAULT_MIN_CHARS,
+    discard_chars: int = DEFAULT_DISCARD_CHARS,
+    max_chars: int = DEFAULT_MAX_CHARS,
+) -> None:
     if not input_path.exists():
         raise FileNotFoundError(
-            f"Missing {input_path} — run extract_markdown.py first"
+            f"Missing {input_path} - run extract_markdown.py first"
         )
 
     records = [
@@ -100,8 +109,14 @@ def build_corpus(input_path: Path, output_path: Path) -> None:
         if line.strip()
     ]
 
-    blocks = merge_and_chunk(records)
+    blocks = merge_and_chunk(
+        records,
+        min_chars=min_chars,
+        discard_chars=discard_chars,
+        max_chars=max_chars,
+    )
 
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as out:
         for i, block in enumerate(blocks, 1):
             out.write(
@@ -122,8 +137,57 @@ def build_corpus(input_path: Path, output_path: Path) -> None:
     print(f"Blocks written: {len(blocks)}")
 
 
+def parse_args() -> argparse.Namespace:
+    ROOT = Path(__file__).resolve().parent.parent
+
+    parser = argparse.ArgumentParser(
+        description="Merge and chunk extracted paragraphs into a corpus JSONL.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "-i",
+        "--input",
+        type=Path,
+        default=ROOT / "data" / "paragraphs.jsonl",
+        help="Path to the input paragraphs JSONL file.",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        default=ROOT / "data" / "corpus.jsonl",
+        help="Path to the output corpus JSONL file.",
+    )
+    parser.add_argument(
+        "--min-chars",
+        type=int,
+        default=DEFAULT_MIN_CHARS,
+        help="Minimum character count before flushing merged paragraphs.",
+    )
+    parser.add_argument(
+        "--discard-chars",
+        type=int,
+        default=DEFAULT_DISCARD_CHARS,
+        help="Minimum character count to keep a chunk (shorter chunks are discarded).",
+    )
+    parser.add_argument(
+        "--max-chars",
+        type=int,
+        default=DEFAULT_MAX_CHARS,
+        help="Maximum character count per chunk before sentence splitting.",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
-    build_corpus(INPUT_PATH, OUTPUT_PATH)
+    args = parse_args()
+    build_corpus(
+        input_path=args.input,
+        output_path=args.output,
+        min_chars=args.min_chars,
+        discard_chars=args.discard_chars,
+        max_chars=args.max_chars,
+    )
 
 
 if __name__ == "__main__":

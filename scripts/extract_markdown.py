@@ -1,26 +1,4 @@
-"""
-Stage 1: PDF -> paragraph records.
-
-Reads the source PDF and emits two artifacts:
-
-    data/paragraphs.jsonl    canonical, read by stage 2
-    data/extracted.md             human-readable dump, NOT read by any stage
-
-JSONL schema (one record per line):
-
-    {"page": <int>, "kind": "heading" | "para", "text": "<str>"}
-
-All line classification lives here and only here:
-  * running header / footer removal
-  * TOC line removal
-  * theorem / section / chapter heading detection
-  * splitting inline headings out of running text
-  * paragraph assembly (hyphenation join, whitespace normalization)
-  * cp1251-as-latin1 mojibake repair
-  * math / negated-relation normalization
-
-Stage 2 (extract_text.py) then only has to do chunking policy.
-"""
+import argparse
 import json
 import re
 import sys
@@ -28,11 +6,6 @@ import unicodedata
 from pathlib import Path
 
 import pymupdf
-
-ROOT = Path(__file__).resolve().parent.parent
-PDF_PATH = ROOT / "data" / "textbook.pdf"
-PARAGRAPHS_PATH = ROOT / "data" / "paragraphs.jsonl"
-MARKDOWN_PATH = ROOT / "data" / "extracted.md"  # debug artifact only
 
 
 LATIN_EXTENDED = re.compile(r"[\u00c0-\u00ff]")
@@ -117,14 +90,12 @@ def repair_word(word: str) -> str:
     return MOJIBAKE_RUN.sub(replace_run, word)
 
 
-def repair_russian(text: str) -> str:
-    LOG_ENCODING_REPAIRS = False
-
+def repair_russian(text: str, log_encoding_repairs: bool = False) -> str:
     def replace_match(match: re.Match) -> str:
         original = match.group()
         repaired = repair_word(original)
 
-        if LOG_ENCODING_REPAIRS and repaired != original:
+        if log_encoding_repairs and repaired != original:
             print(
                 f"Encoding repair: {original!r} -> {repaired!r}",
                 file=sys.stderr,
@@ -186,8 +157,8 @@ def make_paragraph(lines: list[str]) -> str:
     return text.strip()
 
 
-def clean_lines(raw_text: str) -> list[str]:
-    raw_text = repair_math(repair_russian(raw_text))
+def clean_lines(raw_text: str, log_encoding_repairs: bool = False) -> list[str]:
+    raw_text = repair_math(repair_russian(raw_text, log_encoding_repairs))
     lines = [line.strip() for line in raw_text.splitlines()]
 
     cleaned = []
@@ -226,12 +197,15 @@ def split_inline_headings(lines: list[str]) -> list[str]:
     return result
 
 
-def extract_page_records(raw_text: str) -> list[dict] | None:
+def extract_page_records(
+    raw_text: str,
+    log_encoding_repairs: bool = False,
+) -> list[dict] | None:
     """
     Return [{"kind": "heading"|"para", "text": ...}, ...] for a page,
     or None if the page is TOC and should be skipped.
     """
-    lines = clean_lines(raw_text)
+    lines = clean_lines(raw_text, log_encoding_repairs)
 
     chapter_start = next(
         (index for index, line in enumerate(lines) if is_chapter_one(line)),
@@ -275,21 +249,56 @@ def extract_page_records(raw_text: str) -> list[dict] | None:
     return records
 
 
-def main() -> None:
-    if not PDF_PATH.exists():
-        raise FileNotFoundError(f"PDF not found: {PDF_PATH}")
+def parse_args() -> argparse.Namespace:
+    ROOT = Path(__file__).resolve().parent.parent
+    parser = argparse.ArgumentParser(
+        description="Extract paragraphs and headings from a PDF textbook.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--pdf",
+        type=Path,
+        default=ROOT / "data" / "textbook.pdf",
+    )
+    parser.add_argument(
+        "--paragraphs",
+        type=Path,
+        default=ROOT / "data" / "paragraphs.jsonl",
+    )
+    parser.add_argument(
+        "--markdown",
+        type=Path,
+        default=ROOT / "data" / "extracted.md",
+    )
+    parser.add_argument(
+        "--log-encoding-repairs",
+        action="store_true",
+        default=False,
+    )
+    return parser.parse_args()
 
-    PARAGRAPHS_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+def main() -> None:
+    args = parse_args()
+
+    if not args.pdf.exists():
+        raise FileNotFoundError(f"PDF not found: {args.pdf}")
+
+    args.paragraphs.parent.mkdir(parents=True, exist_ok=True)
+    args.markdown.parent.mkdir(parents=True, exist_ok=True)
 
     all_records: list[dict] = []
     markdown_parts: list[str] = []
     skipped_pages: list[int] = []
 
-    with pymupdf.open(PDF_PATH) as pdf:
+    with pymupdf.open(args.pdf) as pdf:
         for page_index, page in enumerate(pdf):
             page_number = page_index + 1
             raw_text = page.get_text("text", sort=True)
-            records = extract_page_records(raw_text)
+            records = extract_page_records(
+                raw_text,
+                log_encoding_repairs=args.log_encoding_repairs,
+            )
 
             if records is None:
                 skipped_pages.append(page_number)
@@ -306,16 +315,16 @@ def main() -> None:
             page_md = "\n\n".join(rec["text"] for rec in records)
             markdown_parts.append(f"<!-- PAGE: {page_number} -->\n{page_md}")
 
-    with PARAGRAPHS_PATH.open("w", encoding="utf-8") as f:
+    with args.paragraphs.open("w", encoding="utf-8") as f:
         for rec in all_records:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
-    MARKDOWN_PATH.write_text(
+    args.markdown.write_text(
         "\n\n".join(markdown_parts) + "\n", encoding="utf-8"
     )
 
-    print(f"Paragraphs     : {PARAGRAPHS_PATH} ({len(all_records)} records)")
-    print(f"Debug markdown : {MARKDOWN_PATH}")
+    print(f"Paragraphs     : {args.paragraphs} ({len(all_records)} records)")
+    print(f"Debug markdown : {args.markdown}")
     print(f"PDF pages      : {len(markdown_parts)}")
     print(f"Skipped TOC    : {skipped_pages}")
 
